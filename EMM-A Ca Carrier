@@ -2,6 +2,10 @@
 // Broadcasts carrier merge-block pose for miner Dock/Undock alignment.
 // Message format on IGC tag EMM-A-DOCK-POSE:
 //   x,y,z|ux,uy,uz|fx,fy,fz
+// NOTE:
+// - Carrier broadcasts its merge-block axes "as-is" (no inversion).
+// - Miner decides docking orientation mapping (e.g. forward same/right opposite)
+//   from these raw carrier vectors.
 
 string carrierMergeBlockName = "EMM-A Ca Merge Block";
 string carrierConnectorName = "EMM-A Ca Connector";
