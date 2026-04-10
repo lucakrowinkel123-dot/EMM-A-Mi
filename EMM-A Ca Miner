@@ -1008,8 +1008,10 @@ void StartUndock()
         minerConnector.Enabled = false;
     }
     Vector3D posePos = ComputeDockPoseRcPosition();
-    desiredUp = Vector3D.Normalize(carrierMergeUp);
-    desiredForward = Vector3D.Normalize(-carrierMergeForward);
+    // Merge direction is along -Z, so align miner forward same as carrier forward,
+    // and flip up so right-hand side becomes opposite.
+    desiredUp = Vector3D.Normalize(-carrierMergeUp);
+    desiredForward = Vector3D.Normalize(carrierMergeForward);
     targetPosition = posePos;
     hasTarget = true;
     autopilotEnabled = true;
@@ -1042,8 +1044,10 @@ void StartDock()
     minerConnector.Enabled = true;
     minerConnector.Disconnect();
 
-    desiredUp = Vector3D.Normalize(carrierMergeUp);
-    desiredForward = Vector3D.Normalize(-carrierMergeForward);
+    // Merge direction is along -Z, so align miner forward same as carrier forward,
+    // and flip up so right-hand side becomes opposite.
+    desiredUp = Vector3D.Normalize(-carrierMergeUp);
+    desiredForward = Vector3D.Normalize(carrierMergeForward);
     targetPosition = posePos;
     hasTarget = true;
     autopilotEnabled = true;
@@ -1057,8 +1061,8 @@ void UpdateDockingState()
     if (!hasCarrierPose)
         return;
 
-    desiredUp = Vector3D.Normalize(carrierMergeUp);
-    desiredForward = Vector3D.Normalize(-carrierMergeForward);
+    desiredUp = Vector3D.Normalize(-carrierMergeUp);
+    desiredForward = Vector3D.Normalize(carrierMergeForward);
 
     if (dockingState == DockingState.UndockingToPose)
     {
@@ -1118,8 +1122,8 @@ void UpdateDockingState()
 
 Vector3D ComputeDockPoseRcPosition()
 {
-    Vector3D up = Vector3D.Normalize(carrierMergeUp);
-    Vector3D forward = Vector3D.Normalize(-carrierMergeForward);
+    Vector3D up = Vector3D.Normalize(-carrierMergeUp);
+    Vector3D forward = Vector3D.Normalize(carrierMergeForward);
     Vector3D right = Vector3D.Normalize(Vector3D.Cross(forward, up));
     Vector3D carrierForward = Vector3D.Normalize(carrierMergeForward);
     Vector3D mergeTarget = carrierMergePosition + carrierForward * (dockPoseDistance + mergeFaceCompensationMeters);
@@ -1129,8 +1133,8 @@ Vector3D ComputeDockPoseRcPosition()
 
 Vector3D ComputeMergeApproachRcPosition()
 {
-    Vector3D up = Vector3D.Normalize(carrierMergeUp);
-    Vector3D forward = Vector3D.Normalize(-carrierMergeForward);
+    Vector3D up = Vector3D.Normalize(-carrierMergeUp);
+    Vector3D forward = Vector3D.Normalize(carrierMergeForward);
     Vector3D right = Vector3D.Normalize(Vector3D.Cross(forward, up));
     Vector3D carrierForward = Vector3D.Normalize(carrierMergeForward);
     Vector3D mergeTarget = carrierMergePosition + carrierForward * mergeFaceCompensationMeters;
