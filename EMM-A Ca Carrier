@@ -1,0 +1,103 @@
+// EMM-A Carrier Dock Broadcaster
+// Broadcasts carrier merge-block pose for miner Dock/Undock alignment.
+// Message format on IGC tag EMM-A-DOCK-POSE:
+//   x,y,z|ux,uy,uz|fx,fy,fz
+// NOTE:
+// - Carrier broadcasts its merge-block axes "as-is" (no inversion).
+// - Miner decides docking orientation mapping (e.g. forward same/right opposite)
+//   from these raw carrier vectors.
+
+string carrierMergeBlockName = "EMM-A Ca Merge Block";
+string carrierConnectorName = "EMM-A Ca Connector";
+string carrierRemoteName = "EMM-A Ca Remote Control";
+string dockBroadcastTag = "EMM-A-DOCK-POSE";
+UpdateFrequency tickSpeed = UpdateFrequency.Update1;
+
+IMyShipMergeBlock carrierMerge;
+IMyShipConnector carrierConnector;
+IMyRemoteControl carrierRemote;
+bool broadcasting = true;
+
+public Program()
+{
+    carrierMerge = GridTerminalSystem.GetBlockWithName(carrierMergeBlockName) as IMyShipMergeBlock;
+    carrierConnector = GridTerminalSystem.GetBlockWithName(carrierConnectorName) as IMyShipConnector;
+    carrierRemote = GridTerminalSystem.GetBlockWithName(carrierRemoteName) as IMyRemoteControl;
+
+    if (carrierMerge == null)
+        throw new Exception("Carrier merge block not found: " + carrierMergeBlockName);
+
+    Runtime.UpdateFrequency = tickSpeed;
+    Echo("Carrier dock broadcaster ready.");
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    if ((updateSource & (UpdateType.Update1 | UpdateType.Update10 | UpdateType.Update100)) != 0)
+    {
+        if (broadcasting)
+            BroadcastPose();
+        WriteStatus();
+        return;
+    }
+
+    HandleCommand(argument);
+}
+
+void HandleCommand(string argument)
+{
+    string cmd = (argument ?? "").Trim();
+    if (string.IsNullOrEmpty(cmd))
+        return;
+
+    switch (cmd.ToLowerInvariant())
+    {
+        case "start":
+        case "on":
+            broadcasting = true;
+            Echo("Broadcast ON");
+            break;
+        case "stop":
+        case "off":
+            broadcasting = false;
+            Echo("Broadcast OFF");
+            break;
+        case "send":
+            BroadcastPose();
+            Echo("Sent pose once.");
+            break;
+        default:
+            Echo("Commands: start|stop|send");
+            break;
+    }
+}
+
+void BroadcastPose()
+{
+    MatrixD wm = carrierMerge.WorldMatrix;
+    Vector3D pos = carrierMerge.GetPosition();
+    Vector3D up = Vector3D.Normalize(wm.Up);
+    Vector3D fwd = Vector3D.Normalize(wm.Forward);
+
+    string payload = V3(pos) + "|" + V3(up) + "|" + V3(fwd);
+    IGC.SendBroadcastMessage(dockBroadcastTag, payload, TransmissionDistance.TransmissionDistanceMax);
+}
+
+string V3(Vector3D v)
+{
+    return v.X.ToString("R") + "," + v.Y.ToString("R") + "," + v.Z.ToString("R");
+}
+
+void WriteStatus()
+{
+    StringBuilder sb = new StringBuilder();
+    sb.AppendLine("EMM-A Carrier Dock Broadcaster");
+    sb.AppendLine("State: " + (broadcasting ? "Broadcasting" : "Paused"));
+    sb.AppendLine("Tag: " + dockBroadcastTag);
+    sb.AppendLine("Merge: " + (carrierMerge != null ? carrierMerge.CustomName : "<missing>"));
+    if (carrierConnector != null)
+        sb.AppendLine("Connector: " + carrierConnector.Status);
+    if (carrierRemote != null)
+        sb.AppendLine("Remote dampeners: " + (carrierRemote.DampenersOverride ? "ON" : "OFF"));
+    Echo(sb.ToString());
+}
