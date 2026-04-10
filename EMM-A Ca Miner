@@ -15,6 +15,8 @@
 // pathpause : pauses queue and active movement; minearea returns to current anchor and waits
 // pathcontinue : resumes queue advancement after pathpause
 // pathstop : stops path mode and clears remaining queued records
+// dock : approach/merge/connect to carrier docking point
+// undock : release merge+connector and fly to dock pose
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
 // MINEH <value> : sets miner lane height footprint (m)
@@ -40,6 +42,17 @@ int maxStuckRetries = 3; // skip hole after this many stuck retries; 0 = retry f
 double pathRecordMeters = 25.0;
 double pathRecordMineDepth = 30.0;
 string pathRecordMineSensorTag = "EMM-A";
+string carrierMergeBlockName = "EMM-A Ca Merge Block";
+string carrierConnectorName = "EMM-A Ca Connector";
+string carrierRemoteName = "EMM-A Ca Remote Control";
+string minerMergeBlockName = "EMM-A Mi Merge Block";
+string minerConnectorName = "EMM-A Mi Connector";
+string minerRemoteName = "EMM-A Mi Remote Control";
+string carrierDockBroadcastTag = "EMM-A-DOCK-POSE";
+double dockPoseDistance = 50.0;
+double dockApproachSpeed = 1.0;
+double dockTravelSpeed = 3.0;
+double mergeFaceCompensationMeters = 2.5; // 1.25m per merge block
 // =============================================
 
 IMyShipController rc;
@@ -96,6 +109,23 @@ bool pathRecordingEnabled = false;
 bool pathRecordingPaused = false;
 bool pathRecordingWaitReturn = false;
 bool cockpitGyroControlForcedOff = false;
+IMyShipMergeBlock minerMergeBlock;
+IMyShipConnector minerConnector;
+IMyBroadcastListener carrierDockListener;
+Vector3D minerMergeOffsetLocal = Vector3D.Zero; // RC local (Right,Up,Forward) from RC to miner merge
+bool hasCarrierPose = false;
+Vector3D carrierMergePosition = Vector3D.Zero;
+Vector3D carrierMergeUp = Vector3D.Zero;
+Vector3D carrierMergeForward = Vector3D.Zero;
+enum DockingState
+{
+    Idle,
+    UndockingToPose,
+    DockingToPose,
+    DockingApproach,
+    DockingWaitConnect
+}
+DockingState dockingState = DockingState.Idle;
 Vector3D pathRecordLastPos = Vector3D.Zero;
 int pathRecordCounter = 0;
 int pathRecordMineCounter = 0;
@@ -143,6 +173,7 @@ public Program ()
     thrust = new ThrusterControl(rc, tickSpeed, GetBlocks<IMyThrust>());
     gyros = new GyroControl(rc, tickSpeed, GetBlocks<IMyGyro>());
     drills = GetBlocks<IMyShipDrill>();
+    InitializeDockingBlocksAndIgc();
 
     if (tickSpeed == UpdateFrequency.Update10)
     { secondsPerTick = 10.0 / 60.0; echoFrequency = 10; }
@@ -173,6 +204,10 @@ public void Main (string argument, UpdateType updateSource)
 
         if (miningEnabled)
             UpdateMiningState();
+
+        UpdateCarrierPoseFromBroadcast();
+        if (dockingState != DockingState.Idle)
+            UpdateDockingState();
 
         bool usedSoftLock = UpdatePathRecordState();
 
@@ -211,6 +246,7 @@ void WriteEcho()
     sb.AppendLine($"Depth mode: {depthMode}");
     sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
     sb.AppendLine($"PathRecord: {(pathRecordingEnabled ? "ON" : "OFF")} {(pathRecordingPaused ? "(paused)" : "")} every {pathRecordMeters:0.0}m");
+    sb.AppendLine($"Docking: {dockingState}" + (hasCarrierPose ? "" : " (no carrier pose)"));
     if (pathRecordMineStage != PathRecordMineStage.Idle)
         sb.AppendLine($"PathRecordMine: {pathRecordMineStage}");
     if (areaMiningMode && areaLaneAnchors.Count > 0)
@@ -421,6 +457,7 @@ void RemoteCommand (string command)
             pathRecordingPaused = false;
             pathRecordingWaitReturn = false;
             pathRecordMineStage = PathRecordMineStage.Idle;
+            dockingState = DockingState.Idle;
             SetCockpitGyroControl(true);
             activeMaxSpeed = 0;
             SetMineIndicatorSensor(false);
@@ -498,7 +535,14 @@ void RemoteCommand (string command)
             pathPausedNavResume = false;
             pathRecords.Clear();
             pathIndex = 0;
+            dockingState = DockingState.Idle;
             Echo("Path mode stopped.");
+            break;
+        case "dock":
+            StartDock();
+            break;
+        case "undock":
+            StartUndock();
             break;
         case "toffreset":
             TOFFR = 0;
@@ -779,6 +823,8 @@ void UpdatePathRunner()
 
     if (miningEnabled)
         return;
+    if (dockingState != DockingState.Idle)
+        return;
 
     if (autopilotEnabled && hasTarget)
     {
@@ -847,6 +893,16 @@ bool ExecutePathRecord(string rawRecord)
         StartAreaMining(record);
         return miningEnabled;
     }
+    if (record.Equals("Dock", StringComparison.OrdinalIgnoreCase))
+    {
+        StartDock();
+        return dockingState != DockingState.Idle;
+    }
+    if (record.Equals("Undock", StringComparison.OrdinalIgnoreCase))
+    {
+        StartUndock();
+        return dockingState != DockingState.Idle;
+    }
 
     // A GPS record that contains ";" is a shorthand minearea entry from the path timer.
     // Path records are expected to drive area mining, so GPS:...<corners>;<orientation>;<depth>
@@ -877,6 +933,209 @@ bool ExecutePathRecord(string rawRecord)
     }
 
     return false;
+}
+
+void InitializeDockingBlocksAndIgc()
+{
+    IMyShipController namedRc = GetBlock<IMyShipController>(minerRemoteName, true);
+    if (namedRc != null)
+        rc = namedRc;
+
+    minerMergeBlock = GetBlock<IMyShipMergeBlock>(minerMergeBlockName, true);
+    minerConnector = GetBlock<IMyShipConnector>(minerConnectorName, true);
+    if (minerMergeBlock != null)
+    {
+        MatrixD wm = rc.WorldMatrix;
+        Vector3D rcToMerge = minerMergeBlock.GetPosition() - rc.GetPosition();
+        minerMergeOffsetLocal = new Vector3D(
+            Vector3D.Dot(rcToMerge, wm.Right),
+            Vector3D.Dot(rcToMerge, wm.Up),
+            Vector3D.Dot(rcToMerge, wm.Forward));
+    }
+
+    carrierDockListener = IGC.RegisterBroadcastListener(carrierDockBroadcastTag);
+    carrierDockListener?.SetMessageCallback("DOCK_IGC");
+}
+
+void UpdateCarrierPoseFromBroadcast()
+{
+    if (carrierDockListener == null)
+        return;
+
+    while (carrierDockListener.HasPendingMessage)
+    {
+        MyIGCMessage msg = carrierDockListener.AcceptMessage();
+        string text = msg.Data as string;
+        if (string.IsNullOrWhiteSpace(text))
+            continue;
+        Vector3D p, u, f;
+        if (TryParseCarrierPose(text, out p, out u, out f))
+        {
+            carrierMergePosition = p;
+            carrierMergeUp = u;
+            carrierMergeForward = f;
+            hasCarrierPose = true;
+        }
+    }
+}
+
+bool TryParseCarrierPose(string text, out Vector3D pos, out Vector3D up, out Vector3D forward)
+{
+    pos = Vector3D.Zero;
+    up = Vector3D.Zero;
+    forward = Vector3D.Zero;
+    string[] parts = text.Split('|');
+    if (parts.Length != 3)
+        return false;
+    return TryParseVector3(parts[0], out pos)
+        && TryParseVector3(parts[1], out up)
+        && TryParseVector3(parts[2], out forward)
+        && up.LengthSquared() > 0.001
+        && forward.LengthSquared() > 0.001;
+}
+
+void StartUndock()
+{
+    if (!hasCarrierPose)
+    {
+        Echo("Undock blocked: waiting for carrier pose broadcast.");
+        return;
+    }
+    if (minerMergeBlock != null) minerMergeBlock.Enabled = false;
+    if (minerConnector != null)
+    {
+        minerConnector.Disconnect();
+        minerConnector.Enabled = false;
+    }
+    Vector3D posePos = ComputeDockPoseRcPosition();
+    desiredUp = Vector3D.Normalize(carrierMergeUp);
+    desiredForward = Vector3D.Normalize(-carrierMergeForward);
+    targetPosition = posePos;
+    hasTarget = true;
+    autopilotEnabled = true;
+    activeMaxSpeed = dockTravelSpeed;
+    dockingState = DockingState.UndockingToPose;
+    Echo("Undocking: flying to dock pose.");
+}
+
+void StartDock()
+{
+    if (!hasCarrierPose)
+    {
+        Echo("Dock blocked: waiting for carrier pose broadcast.");
+        return;
+    }
+    if (minerMergeBlock == null || minerConnector == null)
+    {
+        Echo("Dock blocked: miner merge/connector missing.");
+        return;
+    }
+
+    Vector3D posePos = ComputeDockPoseRcPosition();
+    if (Vector3D.DistanceSquared(rc.GetPosition(), posePos) > dockPoseDistance * dockPoseDistance)
+    {
+        Echo("Dock blocked: miner must be within 50m of dock pose.");
+        return;
+    }
+
+    minerMergeBlock.Enabled = true;
+    minerConnector.Enabled = true;
+    minerConnector.Disconnect();
+
+    desiredUp = Vector3D.Normalize(carrierMergeUp);
+    desiredForward = Vector3D.Normalize(-carrierMergeForward);
+    targetPosition = posePos;
+    hasTarget = true;
+    autopilotEnabled = true;
+    activeMaxSpeed = dockTravelSpeed;
+    dockingState = DockingState.DockingToPose;
+    Echo("Docking: moving to dock pose.");
+}
+
+void UpdateDockingState()
+{
+    if (!hasCarrierPose)
+        return;
+
+    desiredUp = Vector3D.Normalize(carrierMergeUp);
+    desiredForward = Vector3D.Normalize(-carrierMergeForward);
+
+    if (dockingState == DockingState.UndockingToPose)
+    {
+        targetPosition = ComputeDockPoseRcPosition();
+        if (IsAtTargetPose(targetPosition, desiredForward, desiredUp))
+        {
+            autopilotEnabled = false;
+            hasTarget = false;
+            activeMaxSpeed = 0;
+            dockingState = DockingState.Idle;
+            Echo("Undock complete (at dock pose).");
+        }
+        return;
+    }
+
+    if (dockingState == DockingState.DockingToPose)
+    {
+        targetPosition = ComputeDockPoseRcPosition();
+        if (IsAtTargetPose(targetPosition, desiredForward, desiredUp))
+        {
+            dockingState = DockingState.DockingApproach;
+            activeMaxSpeed = dockApproachSpeed;
+            targetPosition = ComputeMergeApproachRcPosition();
+            hasTarget = true;
+            autopilotEnabled = true;
+            Echo("Docking: final approach to merge.");
+        }
+        return;
+    }
+
+    if (dockingState == DockingState.DockingApproach)
+    {
+        targetPosition = ComputeMergeApproachRcPosition();
+        if (minerMergeBlock != null && minerMergeBlock.IsConnected)
+        {
+            dockingState = DockingState.DockingWaitConnect;
+            hasTarget = false;
+            autopilotEnabled = false;
+            activeMaxSpeed = 0;
+            Echo("Docking: merge connected, connecting connector.");
+        }
+        return;
+    }
+
+    if (dockingState == DockingState.DockingWaitConnect)
+    {
+        if (minerConnector != null && minerConnector.Status == MyShipConnectorStatus.Connectable)
+            minerConnector.Connect();
+
+        if (minerConnector != null && minerConnector.Status == MyShipConnectorStatus.Connected)
+        {
+            dockingState = DockingState.Idle;
+            Echo("Dock complete (connector connected).");
+        }
+    }
+}
+
+Vector3D ComputeDockPoseRcPosition()
+{
+    Vector3D up = Vector3D.Normalize(carrierMergeUp);
+    Vector3D forward = Vector3D.Normalize(-carrierMergeForward);
+    Vector3D right = Vector3D.Normalize(Vector3D.Cross(forward, up));
+    Vector3D carrierForward = Vector3D.Normalize(carrierMergeForward);
+    Vector3D mergeTarget = carrierMergePosition + carrierForward * (dockPoseDistance + mergeFaceCompensationMeters);
+    Vector3D minerMergeOffsetDesired = right * minerMergeOffsetLocal.X + up * minerMergeOffsetLocal.Y + forward * minerMergeOffsetLocal.Z;
+    return mergeTarget - minerMergeOffsetDesired;
+}
+
+Vector3D ComputeMergeApproachRcPosition()
+{
+    Vector3D up = Vector3D.Normalize(carrierMergeUp);
+    Vector3D forward = Vector3D.Normalize(-carrierMergeForward);
+    Vector3D right = Vector3D.Normalize(Vector3D.Cross(forward, up));
+    Vector3D carrierForward = Vector3D.Normalize(carrierMergeForward);
+    Vector3D mergeTarget = carrierMergePosition + carrierForward * mergeFaceCompensationMeters;
+    Vector3D minerMergeOffsetDesired = right * minerMergeOffsetLocal.X + up * minerMergeOffsetLocal.Y + forward * minerMergeOffsetLocal.Z;
+    return mergeTarget - minerMergeOffsetDesired;
 }
 
 bool TryLoadPathRecordsFromTimer(out List<string> records, out string timerName)
